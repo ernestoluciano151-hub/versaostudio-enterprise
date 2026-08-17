@@ -1,0 +1,109 @@
+name: CI
+
+# Portões de qualidade — docs/governance/quality-gate.md
+# Todos bloqueiam o merge. Contornar o CI é motivo de rejeição de PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancela execuções antigas do mesmo PR — poupa minutos e dá feedback mais rápido.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  # ── Portão 1: nada de segredos no repositório ──────────────────────────────
+  secrets:
+    name: Segredos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Nenhum ficheiro .env commitado
+        run: |
+          if git ls-files | grep -E '^\.env($|\.)' | grep -v '\.env\.example'; then
+            echo "::error::Ficheiro .env encontrado no repositório."
+            exit 1
+          fi
+          echo "OK — nenhum .env versionado."
+
+      - name: .env.example sem valores reais
+        run: |
+          # Procura padrões de chaves reais que nunca deviam estar no exemplo.
+          if grep -nE '=(sk_live|pk_live|whsec_|re_[A-Za-z0-9]{10,}|[A-Za-z0-9_-]{32,})' .env.example; then
+            echo "::error::.env.example parece conter valores reais."
+            exit 1
+          fi
+          echo "OK — .env.example sem segredos."
+
+  # ── Portões 2–5: qualidade do código ───────────────────────────────────────
+  quality:
+    name: Lint · Typecheck · Testes · Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci
+
+      # Cada passo tem `if: always()` a partir do segundo para que uma falha
+      # no lint não esconda uma falha nos testes. Vemos tudo de uma vez.
+      - name: Lint
+        id: lint
+        run: npm run lint
+
+      - name: Typecheck
+        if: always() && steps.lint.conclusion != 'cancelled'
+        run: npm run typecheck
+
+      - name: Testes unitários
+        if: always() && steps.lint.conclusion != 'cancelled'
+        run: npm run test
+
+      - name: Build
+        if: always() && steps.lint.conclusion != 'cancelled'
+        run: npm run build
+
+  # ── Portão 6: dependências vulneráveis ─────────────────────────────────────
+  audit:
+    name: Auditoria de dependências
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: npm audit (bloqueia em alta/crítica)
+        run: npm audit --audit-level=high
+
+  # ── Portão 7: sincronização RBAC ↔ documentação ────────────────────────────
+  # Redundante face aos testes, mas explícito: se a matriz do rbac.md divergir
+  # de permissions.ts, quero ver isso como um job com nome próprio no PR.
+  rbac:
+    name: Matriz RBAC sincronizada
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run src/lib/auth/__tests__/permissions.matrix.test.ts
