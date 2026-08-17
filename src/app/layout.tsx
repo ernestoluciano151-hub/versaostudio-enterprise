@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
+import { ROBOTS_METADATA } from '@/lib/seo/indexing';
 import './globals.css';
 
 export const metadata: Metadata = {
@@ -10,6 +11,8 @@ export const metadata: Metadata = {
   description:
     'Marketing 360°, audiovisual, identidade visual e presença online em Luanda, Angola.',
   metadataBase: new URL('https://www.versaodigitallda.com'),
+  // Falha fechada até `SITE_INDEXABLE=true`. Ver src/lib/seo/indexing.ts.
+  robots: ROBOTS_METADATA,
 };
 
 export const viewport: Viewport = {
