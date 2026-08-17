@@ -38,9 +38,15 @@ jobs:
 
       - name: .env.example sem valores reais
         run: |
-          # Procura padrões de chaves reais que nunca deviam estar no exemplo.
-          if grep -nE '=(sk_live|pk_live|whsec_|re_[A-Za-z0-9]{10,}|[A-Za-z0-9_-]{32,})' .env.example; then
-            echo "::error::.env.example parece conter valores reais."
+          # Procura chaves REAIS. Os prefixos sozinhos (`whsec_`, `sk_test_`) são
+          # marcadores de posição legítimos — só contam se tiverem conteúdo a seguir.
+          if grep -nE '=(sk_live_|pk_live_|whsec_|re_)[A-Za-z0-9]{8,}' .env.example; then
+            echo "::error::.env.example contém o que parece ser uma chave real."
+            exit 1
+          fi
+          # Segredos gerados: 32+ caracteres base64/hex num valor sem estrutura de URL.
+          if grep -nE '^[A-Z_]+=[A-Za-z0-9+/=_-]{32,}$' .env.example; then
+            echo "::error::.env.example contém um valor longo que parece um segredo."
             exit 1
           fi
           echo "OK — .env.example sem segredos."

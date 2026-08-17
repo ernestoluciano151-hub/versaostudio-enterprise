@@ -2,7 +2,7 @@
 
 import { useActionState, useId, useRef, useState } from 'react';
 import type { ClipboardEvent, KeyboardEvent } from 'react';
-import { TOTP_DIGITS } from '@/lib/auth/totp';
+import { TOTP_DIGITS } from '@/lib/auth/totp-constants';
 import {
   isCompleteTotpCode, messageFor, nextFocusIndex, normalizeTotpCode, spreadPastedCode,
 } from '@/lib/auth/ui-helpers';
@@ -94,8 +94,8 @@ export function TotpChallenge({ callbackUrl, action }: Props) {
         <div className="totp-group">
           {digits.map((digit, index) => (
             <input
-              // A posição é a identidade da caixa — não há reordenação possível.
-              // eslint-disable-next-line react/no-array-index-key
+              // A posição É a identidade da caixa: são 6 posições fixas, sem
+              // reordenação nem inserção. O índice é a chave correta aqui.
               key={index}
               ref={(el) => { inputs.current[index] = el; }}
               className="totp-digit"

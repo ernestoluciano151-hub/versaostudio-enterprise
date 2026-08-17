@@ -38,7 +38,16 @@ export function clientScope(actor: Actor): OwnershipScope {
 export function scopeFor(actor: Actor, permission: Permission): OwnershipScope {
   const base = clientScope(actor);
   if (!isOwnedScope(actor, permission)) return base;
+
+  // EXCEÇÃO JUSTIFICADA à regra `no-restricted-syntax` (comparar papéis).
+  // A regra existe para impedir decisões de PERMISSÃO baseadas no papel — essas
+  // pertencem a requirePermission(). Aqui a decisão é de POSSE: um CLIENT é
+  // limitado por `clientId`, um operacional por `assigneeId`. São critérios de
+  // filtragem diferentes, não níveis de autorização. Ver rbac.md §1 e §7.
+  // Este ficheiro é o único sítio onde a distinção é legítima.
+  // eslint-disable-next-line no-restricted-syntax
   if (actor.role === 'CLIENT') return base;
+
   return { ...base, assigneeId: actor.userId };
 }
 

@@ -1,4 +1,4 @@
-import { TOTP_DIGITS } from './totp';
+import { TOTP_DIGITS } from './totp-constants';
 
 /**
  * Lógica pura da UI de autenticação.

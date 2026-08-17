@@ -12,9 +12,9 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
  * dispensaria de qualquer forma.
  */
 
-export const TOTP_PERIOD_SECONDS = 30 as const;
-export const TOTP_DIGITS = 6 as const;
-export const TOTP_WINDOW = 1 as const; // ±1 período = tolera ±30 s de desvio de relógio
+import { TOTP_DIGITS, TOTP_PERIOD_SECONDS, TOTP_WINDOW } from './totp-constants';
+
+export { TOTP_DIGITS, TOTP_PERIOD_SECONDS, TOTP_WINDOW };
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
