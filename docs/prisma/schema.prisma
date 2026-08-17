@@ -1,0 +1,1855 @@
+// =============================================================================
+// VersaoStudio Enterprise — VersaoDigital OS
+// Schema Prisma completo — Single Source of Truth do modelo de dados
+// =============================================================================
+// REGRAS INVIOLÁVEIS
+//   1. Dinheiro: SEMPRE Int em menor unidade (cêntimos/kwanza-cêntimo) + currency.
+//      NUNCA Float/Decimal implícito. amountMinor = 150000 -> 1.500,00 AOA
+//   2. Multi-tenant desde o início: organizationId em todas as tabelas de negócio.
+//   3. Ledger e AuditLog são append-only (revogar UPDATE/DELETE ao nível da BD).
+//   4. Soft delete via deletedAt onde há valor histórico; hard delete só em GDPR/purga.
+//   5. Todo o índice de leitura frequente é explícito. Nada fica ao acaso.
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions", "relationJoins"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_DATABASE_URL")
+  extensions = [pgcrypto, btree_gist, pg_trgm]
+}
+
+// =============================================================================
+// 1. IDENTITY & ACCESS
+// =============================================================================
+
+model Organization {
+  id           String   @id @default(cuid())
+  name         String
+  legalName    String?
+  taxId        String? // NIF
+  slug         String   @unique
+  locale       String   @default("pt-AO")
+  timezone     String   @default("Africa/Luanda")
+  baseCurrency String   @default("AOA")
+  address      String?
+  city         String?  @default("Luanda")
+  country      String   @default("AO")
+  phone        String?
+  email        String?
+  logoUrl      String?
+  settings     Json     @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships   Membership[]
+  invitations   Invitation[]
+  clients       Client[]
+  leads         Lead[]
+  bookings      Booking[]
+  invoices      Invoice[]
+  payments      Payment[]
+  ledgerEntries LedgerEntry[]
+  services      Service[]
+  priceLists    PriceList[]
+  resources     Resource[]
+  deliverables  Deliverable[]
+  campaigns     MarketingCampaign[]
+  contentPlans  ContentPlan[]
+  saasProjects  SaaSProject[]
+  seoPages      SEOPage[]
+  redirects     Redirect[]
+  auditLogs     AuditLog[]
+  domainEvents  DomainEvent[]
+
+  @@index([slug])
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  emailVerified DateTime?
+  name          String?
+  phone         String?
+  image         String?
+  passwordHash  String? // argon2id; null quando só OAuth
+  mfaEnabled    Boolean   @default(false)
+  mfaSecret     String? // encriptado at-rest (AES-256-GCM, MFA_ENCRYPTION_KEY)
+  mfaVerifiedAt DateTime? // última verificação TOTP bem-sucedida
+  passwordChangedAt  DateTime? // invalida sessões anteriores
+  mustChangePassword Boolean @default(false) // onboarding e reposições
+  locale        String    @default("pt-AO")
+  lastLoginAt   DateTime?
+  lockedUntil   DateTime?
+  failedLogins  Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  memberships Membership[]
+  accounts    Account[]
+  sessions    Session[]
+  clientLinks ClientUser[]
+  auditLogs   AuditLog[]
+  activities  Activity[]
+  assignedJobs ProductionJob[] @relation("JobAssignee")
+  projectAssignments ProjectAssignment[]
+  mfaBackupCodes MfaBackupCode[]
+  authEvents     AuthEvent[]
+
+  @@index([email])
+  @@index([deletedAt])
+}
+
+model Membership {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           Role
+  permissions    String[]     @default([]) // overrides granulares
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@unique([organizationId, userId])
+  @@index([organizationId, role])
+}
+
+// 11 papéis — política em docs/security/rbac.md, decisão em ADR-009.
+// ATENÇÃO: EDITOR foi REDEFINIDO (era conteúdo, agora é pós-produção).
+// O papel de conteúdo passou a CONTENT_MANAGER. Migrar utilizadores ANTES de aplicar.
+enum Role {
+  OWNER
+  ADMIN
+  FINANCE_MANAGER
+  PRODUCER
+  PHOTOGRAPHER
+  VIDEOGRAPHER
+  EDITOR
+  CONTENT_MANAGER
+  SALES
+  STAFF
+  CLIENT
+}
+
+model Invitation {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  email          String
+  role           Role
+  tokenHash      String       @unique
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  invitedById    String
+  createdAt      DateTime     @default(now())
+
+  @@index([organizationId, email])
+}
+
+// NextAuth v5 — sessões em base de dados
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id            String    @id @default(cuid())
+  sessionToken  String    @unique
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expires       DateTime
+  mfaVerifiedAt DateTime? // null = sessão NÃO elevada; bloqueia todo o /admin
+  lastActiveAt  DateTime  @default(now()) // expiração por inatividade
+  ip            String?
+  userAgent     String?
+
+  @@index([userId])
+  @@index([expires])
+}
+
+// Códigos de recuperação MFA — guardados como hash argon2id, uso único
+model MfaBackupCode {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String    @unique
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, usedAt])
+}
+
+// APPEND-ONLY. Sem UPDATE. Sem DELETE. Distinto de AuditLog: muito mais frequente,
+// precisa de índice por e-mail (tentativas em contas inexistentes não têm userId).
+model AuthEvent {
+  id        String        @id @default(cuid())
+  userId    String?
+  user      User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  email     String? // tentativa em conta inexistente
+  type      AuthEventType
+  success   Boolean
+  method    AuthMethod?
+  ip        String?
+  userAgent String?
+  reason    String?
+  at        DateTime      @default(now())
+
+  @@index([userId, at])
+  @@index([email, at])
+  @@index([type, at])
+}
+
+enum AuthEventType {
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  LOGOUT
+  LOGOUT_ALL
+  MFA_VERIFIED
+  MFA_FAILED
+  MFA_ENABLED
+  MFA_DISABLED
+  BACKUP_CODE_USED
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_RESET
+  PASSWORD_CHANGED
+  ACCOUNT_LOCKED
+  ACCOUNT_UNLOCKED
+  SESSION_REVOKED
+  MAGIC_LINK_SENT
+  MAGIC_LINK_USED
+  ROLE_CHANGED
+  ACCESS_DENIED // tentativa de acesso a rota protegida sem sessão válida
+}
+
+enum AuthMethod {
+  PASSWORD
+  MAGIC_LINK
+  TOTP
+  BACKUP_CODE
+  OAUTH
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// =============================================================================
+// 2. CRM
+// =============================================================================
+
+model Lead {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  email          String?
+  phone          String?
+  company        String?
+  message        String?      @db.Text
+  status         LeadStatus   @default(NEW)
+  score          Int          @default(0)
+  serviceInterest String?
+  estimatedValueMinor Int?
+  currency       String       @default("AOA")
+
+  sourceId String?
+  source   LeadSource? @relation(fields: [sourceId], references: [id])
+
+  utmSource   String?
+  utmMedium   String?
+  utmCampaign String?
+  utmTerm     String?
+  utmContent  String?
+  referrer    String?
+  landingPage String?
+
+  campaignId String?
+  campaign   MarketingCampaign? @relation(fields: [campaignId], references: [id])
+
+  convertedClientId String?
+  convertedClient   Client? @relation(fields: [convertedClientId], references: [id])
+  convertedAt       DateTime?
+
+  ownerId   String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  activities  Activity[]
+  proposals   Proposal[]
+  conversions ConversionEvent[]
+
+  @@index([organizationId, status])
+  @@index([organizationId, createdAt])
+  @@index([campaignId])
+  @@index([email])
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  PROPOSAL_SENT
+  WON
+  LOST
+}
+
+model LeadSource {
+  id       String  @id @default(cuid())
+  name     String
+  channel  Channel
+  slug     String  @unique
+  isActive Boolean @default(true)
+
+  leads       Lead[]
+  conversions ConversionEvent[]
+}
+
+enum Channel {
+  ORGANIC_SEARCH
+  PAID_SEARCH
+  SOCIAL_ORGANIC
+  SOCIAL_PAID
+  DIRECT
+  REFERRAL
+  EMAIL
+  WHATSAPP
+  EVENT
+  PARTNER
+  OTHER
+}
+
+model Client {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  type           ClientType   @default(INDIVIDUAL)
+  name           String
+  legalName      String?
+  taxId          String?
+  email          String
+  phone          String?
+  whatsapp       String?
+  address        String?
+  city           String?      @default("Luanda")
+  country        String       @default("AO")
+  notes          String?      @db.Text
+  tags           String[]     @default([])
+  lifetimeValueMinor Int      @default(0)
+  currency       String       @default("AOA")
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  deletedAt      DateTime?
+
+  users        ClientUser[]
+  leads        Lead[]
+  bookings     Booking[]
+  proposals    Proposal[]
+  invoices     Invoice[]
+  deliverables Deliverable[]
+  documents    Document[]
+  saasProjects SaaSProject[]
+  activities   Activity[]
+
+  @@unique([organizationId, email])
+  @@index([organizationId, name])
+  @@index([deletedAt])
+}
+
+enum ClientType {
+  INDIVIDUAL
+  COMPANY
+  AGENCY
+  PUBLIC_SECTOR
+}
+
+// Liga uma conta de utilizador ao(s) cliente(s) que pode ver no portal
+model ClientUser {
+  id        String   @id @default(cuid())
+  clientId  String
+  client    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isPrimary Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@unique([clientId, userId])
+  @@index([userId])
+}
+
+model Proposal {
+  id             String         @id @default(cuid())
+  organizationId String
+  number         String
+  clientId       String?
+  client         Client?        @relation(fields: [clientId], references: [id])
+  leadId         String?
+  lead           Lead?          @relation(fields: [leadId], references: [id])
+  title          String
+  status         ProposalStatus @default(DRAFT)
+  version        Int            @default(1)
+  currency       String         @default("AOA")
+  subtotalMinor  Int
+  discountMinor  Int            @default(0)
+  taxMinor       Int            @default(0)
+  totalMinor     Int
+  validUntil     DateTime
+  content        Json // itens congelados no envio
+  pdfUrl         String?
+  sentAt         DateTime?
+  viewedAt       DateTime?
+  respondedAt    DateTime?
+  createdById    String
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  bookings Booking[]
+
+  @@unique([organizationId, number])
+  @@index([organizationId, status])
+  @@index([clientId])
+}
+
+enum ProposalStatus {
+  DRAFT
+  SENT
+  VIEWED
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+model Activity {
+  id        String       @id @default(cuid())
+  type      ActivityType
+  subject   String
+  notes     String?      @db.Text
+  dueAt     DateTime?
+  doneAt    DateTime?
+  leadId    String?
+  lead      Lead?        @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  clientId  String?
+  client    Client?      @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User         @relation(fields: [userId], references: [id])
+  createdAt DateTime     @default(now())
+
+  @@index([leadId])
+  @@index([clientId])
+  @@index([userId, dueAt])
+}
+
+enum ActivityType {
+  CALL
+  MEETING
+  EMAIL
+  WHATSAPP
+  NOTE
+  TASK
+  SITE_VISIT
+}
+
+// =============================================================================
+// 3. CATÁLOGO DE SERVIÇOS E PREÇOS
+// =============================================================================
+
+model ServiceCategory {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String? @db.Text
+  icon        String?
+  sortOrder   Int     @default(0)
+  isActive    Boolean @default(true)
+
+  services Service[]
+}
+
+model Service {
+  id             String          @id @default(cuid())
+  organizationId String
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  categoryId     String
+  category       ServiceCategory @relation(fields: [categoryId], references: [id])
+  name           String
+  slug           String
+  shortDescription String?       @db.Text
+  description    String?         @db.Text
+  deliveryDays   Int             @default(5)
+  durationMinutes Int? // duração da sessão, quando aplicável
+  requiresBooking Boolean        @default(true)
+  isRecurring    Boolean         @default(false) // pacotes mensais
+  isActive       Boolean         @default(true)
+  sortOrder      Int             @default(0)
+  seoPageId      String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  prices        PriceListItem[]
+  bookingItems  BookingItem[]
+  resourceLinks ServiceResource[]
+
+  @@unique([organizationId, slug])
+  @@index([organizationId, isActive])
+}
+
+model PriceList {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  currency       String       @default("AOA")
+  validFrom      DateTime
+  validUntil     DateTime?
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+
+  items PriceListItem[]
+
+  @@index([organizationId, isActive, validFrom])
+}
+
+model PriceListItem {
+  id          String    @id @default(cuid())
+  priceListId String
+  priceList   PriceList @relation(fields: [priceListId], references: [id], onDelete: Cascade)
+  serviceId   String
+  service     Service   @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  unitAmountMinor Int
+  minQuantity Int       @default(1)
+  depositPercent Int    @default(50) // % exigida para confirmar reserva
+  notes       String?
+
+  @@unique([priceListId, serviceId])
+}
+
+model Resource {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  type           ResourceType
+  name           String
+  description    String?
+  isBookable     Boolean      @default(true)
+  isActive       Boolean      @default(true)
+
+  serviceLinks      ServiceResource[]
+  bookingResources  BookingResource[]
+  availabilityRules AvailabilityRule[]
+}
+
+enum ResourceType {
+  STUDIO
+  PHOTOGRAPHER
+  VIDEOGRAPHER
+  EDITOR
+  DESIGNER
+  EQUIPMENT
+  VEHICLE
+}
+
+model ServiceResource {
+  serviceId  String
+  service    Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  resourceId String
+  resource   Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  quantity   Int      @default(1)
+
+  @@id([serviceId, resourceId])
+}
+
+model AvailabilityRule {
+  id         String    @id @default(cuid())
+  resourceId String
+  resource   Resource  @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  weekday    Int? // 0=domingo ... 6=sábado; null = data específica
+  specificDate DateTime?
+  startTime  String // "08:00"
+  endTime    String // "18:00"
+  isBlackout Boolean   @default(false)
+  reason     String?
+
+  @@index([resourceId, weekday])
+  @@index([resourceId, specificDate])
+}
+
+// =============================================================================
+// 4. BOOKING & PRODUCTION
+// =============================================================================
+
+model Booking {
+  id             String        @id @default(cuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  reference      String // legível: VD-2026-00123
+  clientId       String?
+  client         Client?       @relation(fields: [clientId], references: [id])
+  proposalId     String?
+  proposal       Proposal?     @relation(fields: [proposalId], references: [id])
+
+  // contacto quando a reserva é criada sem conta
+  guestName  String?
+  guestEmail String?
+  guestPhone String?
+
+  status BookingStatus @default(DRAFT)
+
+  scheduledStart DateTime
+  scheduledEnd   DateTime
+  location       String?
+  locationNotes  String?  @db.Text
+
+  currency      String @default("AOA")
+  subtotalMinor Int    @default(0)
+  discountMinor Int    @default(0)
+  taxMinor      Int    @default(0)
+  totalMinor    Int    @default(0)
+  depositMinor  Int    @default(0) // exigido para confirmar
+  paidMinor     Int    @default(0) // derivado do ledger; reconciliado
+
+  holdExpiresAt DateTime? // libertação automática do slot
+  confirmedAt   DateTime?
+  cancelledAt   DateTime?
+  cancelReason  String?
+  cancelledById String?
+
+  internalNotes String? @db.Text
+  clientNotes   String? @db.Text
+  metadata      Json    @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items        BookingItem[]
+  resources    BookingResource[]
+  productionJobs ProductionJob[]
+  invoices     Invoice[]
+  payments     Payment[]
+  deliverables Deliverable[]
+
+  @@unique([organizationId, reference])
+  @@index([organizationId, status, scheduledStart])
+  @@index([clientId, scheduledStart])
+  @@index([status, holdExpiresAt])
+}
+
+enum BookingStatus {
+  DRAFT
+  PENDING
+  CONFIRMED
+  IN_PRODUCTION
+  DELIVERED
+  CLOSED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+}
+
+model BookingItem {
+  id              String  @id @default(cuid())
+  bookingId       String
+  booking         Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  serviceId       String
+  service         Service @relation(fields: [serviceId], references: [id])
+  description     String
+  quantity        Int     @default(1)
+  unitAmountMinor Int // congelado no momento da reserva
+  totalMinor      Int
+
+  @@index([bookingId])
+}
+
+model BookingResource {
+  bookingId  String
+  booking    Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  resourceId String
+  resource   Resource @relation(fields: [resourceId], references: [id])
+
+  // Constraint de exclusão criada por migração SQL manual:
+  //   ALTER TABLE "BookingResource" ADD CONSTRAINT no_overlap
+  //   EXCLUDE USING gist ("resourceId" WITH =, "period" WITH &&)
+  //   WHERE (status = 'CONFIRMED');
+  periodStart DateTime
+  periodEnd   DateTime
+
+  @@id([bookingId, resourceId])
+  @@index([resourceId, periodStart, periodEnd])
+}
+
+model ProductionJob {
+  id           String    @id @default(cuid())
+  bookingId    String
+  booking      Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  title        String
+  stage        JobStage  @default(PREPARATION)
+  assigneeId   String?
+  assignee     User?     @relation("JobAssignee", fields: [assigneeId], references: [id])
+  checklist    Json      @default("[]")
+  startedAt    DateTime?
+  completedAt  DateTime?
+  dueAt        DateTime?
+  notes        String?   @db.Text
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([bookingId])
+  @@index([assigneeId, stage])
+}
+
+enum JobStage {
+  PREPARATION
+  SHOOTING
+  INGEST
+  EDITING
+  COLOR_GRADING
+  SOUND
+  REVIEW
+  CLIENT_REVIEW
+  FINAL_EXPORT
+  DELIVERED
+}
+
+// =============================================================================
+// 5. BILLING & PAYMENTS
+// =============================================================================
+
+model Invoice {
+  id             String        @id @default(cuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  number         String // sequencial certificado: FT VD2026/000123
+  series         String        @default("VD2026")
+  clientId       String
+  client         Client        @relation(fields: [clientId], references: [id])
+  bookingId      String?
+  booking        Booking?      @relation(fields: [bookingId], references: [id])
+  saasProjectId  String?
+  saasProject    SaaSProject?  @relation(fields: [saasProjectId], references: [id])
+
+  type   InvoiceType   @default(INVOICE)
+  status InvoiceStatus @default(DRAFT)
+
+  currency      String @default("AOA")
+  subtotalMinor Int
+  discountMinor Int    @default(0)
+  taxRate       Int    @default(1400) // basis points: 1400 = 14 % IVA
+  taxMinor      Int    @default(0)
+  totalMinor    Int
+  paidMinor     Int    @default(0)
+  dueMinor      Int    @default(0)
+
+  issuedAt DateTime?
+  dueAt    DateTime?
+  paidAt   DateTime?
+  voidedAt DateTime?
+  voidReason String?
+
+  pdfUrl  String?
+  hashSig String? // encadeamento para integridade documental
+
+  notes     String?  @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lines         InvoiceLine[]
+  payments      Payment[]
+  ledgerEntries LedgerEntry[]
+  creditNotes   Invoice[]     @relation("CreditNoteOf")
+  creditNoteOfId String?
+  creditNoteOf  Invoice?      @relation("CreditNoteOf", fields: [creditNoteOfId], references: [id])
+
+  @@unique([organizationId, series, number])
+  @@index([organizationId, status, dueAt])
+  @@index([clientId])
+}
+
+enum InvoiceType {
+  PROFORMA
+  INVOICE
+  RECEIPT
+  CREDIT_NOTE
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  VOID
+}
+
+model InvoiceLine {
+  id              String  @id @default(cuid())
+  invoiceId       String
+  invoice         Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description     String
+  quantity        Int     @default(1)
+  unitAmountMinor Int
+  taxRate         Int     @default(1400)
+  totalMinor      Int
+  sortOrder       Int     @default(0)
+
+  @@index([invoiceId])
+}
+
+model Payment {
+  id             String          @id @default(cuid())
+  organizationId String
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invoiceId      String?
+  invoice        Invoice?        @relation(fields: [invoiceId], references: [id])
+  bookingId      String?
+  booking        Booking?        @relation(fields: [bookingId], references: [id])
+  clientId       String?
+
+  provider PaymentProvider
+  method   PaymentMethodType
+  status   PaymentStatus     @default(INITIATED)
+
+  currency      String @default("AOA")
+  amountMinor   Int
+  feeMinor      Int    @default(0)
+  netMinor      Int    @default(0)
+  refundedMinor Int    @default(0)
+  fxRate        Int? // basis points, quando há conversão
+
+  providerRef     String? // PaymentIntent id / referência GPO
+  providerStatus  String?
+  idempotencyKey  String?
+
+  initiatedAt DateTime  @default(now())
+  capturedAt  DateTime?
+  failedAt    DateTime?
+  expiresAt   DateTime?
+  failureCode String?
+  failureMessage String?
+
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  emisReference EMISPaymentReference?
+  mcxTransaction MulticaixaTransaction?
+  providerEvents PaymentProviderEvent[]
+  ledgerEntries  LedgerEntry[]
+  refunds        Refund[]
+
+  @@unique([provider, providerRef])
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, status, initiatedAt])
+  @@index([status, expiresAt]) // alvo do job de reconciliação
+  @@index([bookingId])
+}
+
+enum PaymentProvider {
+  STRIPE
+  EMIS
+  BANK_TRANSFER
+  CASH
+  INTERNAL_CREDIT
+}
+
+enum PaymentMethodType {
+  CARD_INTERNATIONAL
+  MULTICAIXA_EXPRESS
+  MULTICAIXA_REFERENCE
+  CARD_LOCAL
+  BANK_TRANSFER
+  CASH
+  CREDIT_NOTE
+}
+
+enum PaymentStatus {
+  INITIATED
+  PENDING
+  CAPTURED
+  FAILED
+  EXPIRED
+  CANCELLED
+  PARTIALLY_REFUNDED
+  REFUNDED
+  DISPUTED
+}
+
+model EMISPaymentReference {
+  id         String   @id @default(cuid())
+  paymentId  String   @unique
+  payment    Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  reference  String   @unique // referência enviada ao GPO
+  frameToken String? // token do iframe (curta duração)
+  posId      String?
+  entityCode String?
+  callbackUrl String?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([reference])
+}
+
+model MulticaixaTransaction {
+  id             String   @id @default(cuid())
+  paymentId      String   @unique
+  payment        Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  transactionId  String?  @unique // id atribuído pelo GPO
+  terminalId     String?
+  mobileNumber   String? // mascarado em logs
+  authorizationCode String?
+  rawStatus      String?
+  confirmedAt    DateTime?
+  rawPayload     Json? // payload bruto, imutável
+  createdAt      DateTime @default(now())
+}
+
+// Registo bruto e imutável de tudo o que chega de um provedor
+model PaymentProviderEvent {
+  id              String          @id @default(cuid())
+  provider        PaymentProvider
+  providerEventId String
+  eventType       String
+  paymentId       String?
+  payment         Payment?        @relation(fields: [paymentId], references: [id])
+  payload         Json
+  signatureValid  Boolean         @default(false)
+  sourceIp        String?
+  receivedAt      DateTime        @default(now())
+  processedAt     DateTime?
+  processingError String?
+  attempts        Int             @default(0)
+
+  @@unique([provider, providerEventId])
+  @@index([paymentId])
+  @@index([processedAt])
+}
+
+// APPEND-ONLY. Sem UPDATE. Sem DELETE.
+model LedgerEntry {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  entryType      LedgerEntryType
+  direction      LedgerDirection
+  currency       String       @default("AOA")
+  amountMinor    Int
+  invoiceId      String?
+  invoice        Invoice?     @relation(fields: [invoiceId], references: [id])
+  paymentId      String?
+  payment        Payment?     @relation(fields: [paymentId], references: [id])
+  refundId       String?
+  description    String
+  reversalOfId   String? // correção = nova entrada, nunca update
+  occurredAt     DateTime     @default(now())
+  recordedAt     DateTime     @default(now())
+  recordedById   String?
+  metadata       Json         @default("{}")
+
+  @@index([organizationId, occurredAt])
+  @@index([invoiceId])
+  @@index([paymentId])
+}
+
+enum LedgerEntryType {
+  PAYMENT_RECEIVED
+  REFUND_ISSUED
+  FEE_CHARGED
+  INVOICE_ISSUED
+  CREDIT_NOTE
+  ADJUSTMENT
+  FX_DIFFERENCE
+  WRITE_OFF
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+model Refund {
+  id           String       @id @default(cuid())
+  paymentId    String
+  payment      Payment      @relation(fields: [paymentId], references: [id])
+  amountMinor  Int
+  currency     String       @default("AOA")
+  reason       String
+  status       RefundStatus @default(REQUESTED)
+  providerRef  String?
+  requestedById String
+  approvedById String?
+  requestedAt  DateTime     @default(now())
+  processedAt  DateTime?
+  notes        String?      @db.Text
+
+  @@index([paymentId, status])
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  PROCESSING
+  COMPLETED
+  REJECTED
+  FAILED
+}
+
+// Garante que um POST repetido não cria dois efeitos
+model IdempotencyRecord {
+  id             String   @id @default(cuid())
+  organizationId String?
+  endpoint       String
+  idempotencyKey String
+  requestHash    String
+  responseStatus Int?
+  responseBody   Json?
+  lockedAt       DateTime @default(now())
+  completedAt    DateTime?
+  expiresAt      DateTime
+
+  @@unique([endpoint, idempotencyKey])
+  @@index([expiresAt])
+}
+
+// =============================================================================
+// 6. DELIVERY & FILES
+// =============================================================================
+
+model Deliverable {
+  id             String            @id @default(cuid())
+  organizationId String
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  bookingId      String?
+  booking        Booking?          @relation(fields: [bookingId], references: [id])
+  saasProjectId  String?
+  saasProject    SaaSProject?      @relation(fields: [saasProjectId], references: [id])
+  clientId       String
+  client         Client            @relation(fields: [clientId], references: [id])
+  title          String
+  description    String?           @db.Text
+  status         DeliverableStatus @default(DRAFT)
+  accessType     AccessType        @default(CLIENT_ONLY)
+  passwordHash   String?
+  publishedAt    DateTime?
+  approvedAt     DateTime?
+  expiresAt      DateTime?
+  purgeAt        DateTime? // política de retenção
+  purgedAt       DateTime?
+  downloadLimit  Int?
+  downloadCount  Int               @default(0)
+  revisionCount  Int               @default(0)
+  maxRevisions   Int               @default(2)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  files      FileObject[]
+  accessLogs FileAccessLog[]
+
+  @@index([organizationId, status])
+  @@index([clientId])
+  @@index([purgeAt])
+}
+
+enum DeliverableStatus {
+  DRAFT
+  PUBLISHED
+  CLIENT_REVIEW
+  REVISION_REQUESTED
+  APPROVED
+  ARCHIVED
+  PURGED
+}
+
+enum AccessType {
+  CLIENT_ONLY
+  PASSWORD
+  PUBLIC_LINK
+}
+
+model FileObject {
+  id            String      @id @default(cuid())
+  deliverableId String?
+  deliverable   Deliverable? @relation(fields: [deliverableId], references: [id], onDelete: Cascade)
+  bucket        String      @default("versaostudio")
+  storageKey    String      @unique
+  fileName      String
+  mimeType      String
+  sizeBytes     BigInt
+  checksumSha256 String?
+  width         Int?
+  height        Int?
+  durationSec   Int?
+  kind          FileKind    @default(OTHER)
+  isPreview     Boolean     @default(false)
+  thumbnailKey  String?
+  uploadedById  String?
+  uploadedAt    DateTime    @default(now())
+  deletedAt     DateTime?
+
+  accessLogs FileAccessLog[]
+
+  @@index([deliverableId])
+  @@index([deletedAt])
+}
+
+enum FileKind {
+  PHOTO
+  VIDEO
+  AUDIO
+  DOCUMENT
+  DESIGN_SOURCE
+  ARCHIVE
+  OTHER
+}
+
+model FileAccessLog {
+  id            String      @id @default(cuid())
+  fileId        String?
+  file          FileObject? @relation(fields: [fileId], references: [id], onDelete: SetNull)
+  deliverableId String?
+  deliverable   Deliverable? @relation(fields: [deliverableId], references: [id], onDelete: SetNull)
+  userId        String?
+  action        FileAction
+  ip            String?
+  userAgent     String?
+  bytesServed   BigInt?
+  at            DateTime    @default(now())
+
+  @@index([deliverableId, at])
+  @@index([userId, at])
+}
+
+enum FileAction {
+  VIEW
+  DOWNLOAD
+  PREVIEW
+  SHARE_LINK_CREATED
+  DELETE
+}
+
+model Document {
+  id         String       @id @default(cuid())
+  clientId   String
+  client     Client       @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  type       DocumentType
+  title      String
+  storageKey String
+  signedAt   DateTime?
+  signedBy   String?
+  expiresAt  DateTime?
+  createdAt  DateTime     @default(now())
+
+  @@index([clientId, type])
+}
+
+enum DocumentType {
+  CONTRACT
+  IMAGE_RIGHTS_RELEASE
+  NDA
+  PROPOSAL_PDF
+  INVOICE_PDF
+  IDENTIFICATION
+  OTHER
+}
+
+// =============================================================================
+// 7. AGENCY & MARKETING
+// =============================================================================
+
+model MarketingCampaign {
+  id             String         @id @default(cuid())
+  organizationId String
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  slug           String
+  objective      CampaignObjective
+  status         CampaignStatus @default(DRAFT)
+  clientId       String? // campanha para cliente (serviço de agência)
+  isInternal     Boolean        @default(true)
+
+  channels  Channel[] @default([])
+  audience  String?   @db.Text
+  keyMessage String?  @db.Text
+
+  currency      String @default("AOA")
+  budgetMinor   Int    @default(0)
+  spentMinor    Int    @default(0)
+  revenueMinor  Int    @default(0)
+
+  targetLeads       Int?
+  targetConversions Int?
+
+  startDate DateTime
+  endDate   DateTime?
+  launchedAt DateTime?
+
+  utmCampaign String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  leads       Lead[]
+  posts       SocialMediaPost[]
+  contentPlans ContentPlan[]
+  conversions ConversionEvent[]
+
+  @@unique([organizationId, slug])
+  @@index([organizationId, status, startDate])
+}
+
+enum CampaignObjective {
+  AWARENESS
+  TRAFFIC
+  LEAD_GENERATION
+  CONVERSION
+  RETENTION
+  RECRUITMENT
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+model ContentPlan {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  campaignId     String?
+  campaign       MarketingCampaign? @relation(fields: [campaignId], references: [id])
+  clientId       String?
+  title          String
+  month          Int
+  year           Int
+  status         ContentPlanStatus @default(DRAFT)
+  notes          String?      @db.Text
+  approvedAt     DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  posts SocialMediaPost[]
+
+  @@index([organizationId, year, month])
+}
+
+enum ContentPlanStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  IN_EXECUTION
+  COMPLETED
+}
+
+model SocialMediaPost {
+  id            String      @id @default(cuid())
+  contentPlanId String?
+  contentPlan   ContentPlan? @relation(fields: [contentPlanId], references: [id])
+  campaignId    String?
+  campaign      MarketingCampaign? @relation(fields: [campaignId], references: [id])
+  clientId      String?
+  platform      SocialPlatform
+  format        PostFormat  @default(IMAGE)
+  caption       String      @db.Text
+  hashtags      String[]    @default([])
+  mediaKeys     String[]    @default([])
+  status        PostStatus  @default(DRAFT)
+  version       Int         @default(1)
+  scheduledFor  DateTime?
+  publishedAt   DateTime?
+  externalId    String?
+  externalUrl   String?
+
+  impressions Int @default(0)
+  reach       Int @default(0)
+  engagements Int @default(0)
+  clicks      Int @default(0)
+  saves       Int @default(0)
+  shares      Int @default(0)
+
+  createdById String
+  approvedById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([campaignId, scheduledFor])
+  @@index([status, scheduledFor])
+}
+
+enum SocialPlatform {
+  INSTAGRAM
+  FACEBOOK
+  TIKTOK
+  LINKEDIN
+  YOUTUBE
+  WHATSAPP_STATUS
+  X
+}
+
+enum PostFormat {
+  IMAGE
+  CAROUSEL
+  REEL
+  STORY
+  VIDEO
+  TEXT
+  LIVE
+}
+
+enum PostStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  SCHEDULED
+  PUBLISHED
+  FAILED
+  ARCHIVED
+}
+
+model ConversionEvent {
+  id             String     @id @default(cuid())
+  organizationId String
+  type           ConversionType
+  value          Int        @default(0) // amountMinor quando aplicável
+  currency       String     @default("AOA")
+  leadId         String?
+  lead           Lead?      @relation(fields: [leadId], references: [id])
+  campaignId     String?
+  campaign       MarketingCampaign? @relation(fields: [campaignId], references: [id])
+  sourceId       String?
+  source         LeadSource? @relation(fields: [sourceId], references: [id])
+  sessionId      String?
+  pagePath       String?
+  utmSource      String?
+  utmMedium      String?
+  utmCampaign    String?
+  metadata       Json       @default("{}")
+  occurredAt     DateTime   @default(now())
+
+  @@index([organizationId, type, occurredAt])
+  @@index([campaignId, occurredAt])
+}
+
+enum ConversionType {
+  PAGE_VIEW
+  FORM_SUBMIT
+  WHATSAPP_CLICK
+  PHONE_CLICK
+  BOOKING_STARTED
+  BOOKING_CREATED
+  BOOKING_CONFIRMED
+  PAYMENT_COMPLETED
+  PROPOSAL_ACCEPTED
+  NEWSLETTER_SIGNUP
+}
+
+// =============================================================================
+// 8. SAAS / DESENVOLVIMENTO
+// =============================================================================
+
+model SaaSProject {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  clientId       String
+  client         Client       @relation(fields: [clientId], references: [id])
+  name           String
+  slug           String
+  type           ProjectType  @default(WEBSITE)
+  stage          ProjectStage @default(DISCOVERY)
+  description    String?      @db.Text
+  repositoryUrl  String?
+  stagingUrl     String?
+  productionUrl  String?
+
+  currency       String @default("AOA")
+  contractValueMinor Int  @default(0)
+  monthlyFeeMinor    Int  @default(0)
+
+  startDate DateTime?
+  targetDate DateTime?
+  liveDate  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  websites     ClientWebsite[]
+  assignments  ProjectAssignment[]
+  milestones   Milestone[]
+  deployments  Deployment[]
+  invoices     Invoice[]
+  deliverables Deliverable[]
+
+  @@unique([organizationId, slug])
+  @@index([organizationId, stage])
+  @@index([clientId])
+}
+
+enum ProjectType {
+  WEBSITE
+  LANDING_PAGE
+  ECOMMERCE
+  SAAS_APPLICATION
+  MOBILE_APP
+  INTEGRATION
+  MAINTENANCE
+}
+
+enum ProjectStage {
+  DISCOVERY
+  DESIGN
+  BUILD
+  UAT
+  LIVE
+  MAINTENANCE
+  ARCHIVED
+  CANCELLED
+}
+
+// Âmbito atribuído para EDITOR (pós-produção) — sem isto não há critério de posse
+// para "projetos atribuídos". Ver docs/security/rbac-policy-final.md §5.
+model ProjectAssignment {
+  id            String      @id @default(cuid())
+  saasProjectId String
+  saasProject   SaaSProject @relation(fields: [saasProjectId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role          String? // função no projeto: "editor", "colorista", "sound"
+  assignedAt    DateTime    @default(now())
+  assignedById  String
+
+  @@unique([saasProjectId, userId]) // cria índice composto (saasProjectId, userId)
+  @@index([saasProjectId, userId])
+  @@index([userId])
+}
+
+model Milestone {
+  id            String    @id @default(cuid())
+  saasProjectId String
+  saasProject   SaaSProject @relation(fields: [saasProjectId], references: [id], onDelete: Cascade)
+  title         String
+  description   String?   @db.Text
+  dueAt         DateTime?
+  completedAt   DateTime?
+  paymentTriggerPercent Int? // % do contrato a faturar nesta etapa
+  sortOrder     Int       @default(0)
+
+  @@index([saasProjectId])
+}
+
+model ClientWebsite {
+  id            String       @id @default(cuid())
+  saasProjectId String
+  saasProject   SaaSProject  @relation(fields: [saasProjectId], references: [id], onDelete: Cascade)
+  domain        String       @unique
+  hostingProvider String?
+  cdnProvider   String?
+  sslExpiresAt  DateTime?
+  uptimeMonitorUrl String?
+  analyticsId   String?
+  isLive        Boolean      @default(false)
+  notes         String?      @db.Text
+  createdAt     DateTime     @default(now())
+
+  domains     DomainManagement[]
+  deployments Deployment[]
+}
+
+model DomainManagement {
+  id              String        @id @default(cuid())
+  clientWebsiteId String
+  clientWebsite   ClientWebsite @relation(fields: [clientWebsiteId], references: [id], onDelete: Cascade)
+  domain          String
+  registrar       String?
+  registeredAt    DateTime?
+  expiresAt       DateTime?
+  autoRenew       Boolean       @default(true)
+  nameservers     String[]      @default([])
+  dnsProvider     String?
+  // Credenciais NUNCA em texto claro — apenas referência a cofre externo
+  credentialVaultRef String?
+  renewalCostMinor Int?
+  currency        String        @default("AOA")
+
+  @@index([expiresAt])
+}
+
+model Deployment {
+  id              String           @id @default(cuid())
+  saasProjectId   String
+  saasProject     SaaSProject      @relation(fields: [saasProjectId], references: [id], onDelete: Cascade)
+  clientWebsiteId String?
+  clientWebsite   ClientWebsite?   @relation(fields: [clientWebsiteId], references: [id])
+  environment     DeployEnvironment @default(PRODUCTION)
+  commitSha       String?
+  version         String?
+  status          DeployStatus     @default(PENDING)
+  triggeredById   String?
+  startedAt       DateTime         @default(now())
+  finishedAt      DateTime?
+  logUrl          String?
+  rollbackOfId    String?
+
+  @@index([saasProjectId, startedAt])
+}
+
+enum DeployEnvironment {
+  PREVIEW
+  STAGING
+  PRODUCTION
+}
+
+enum DeployStatus {
+  PENDING
+  BUILDING
+  SUCCESS
+  FAILED
+  ROLLED_BACK
+}
+
+// =============================================================================
+// 9. CONTENT & SEO
+// =============================================================================
+
+model SEOPage {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  slug           String
+  locale         String       @default("pt-AO")
+  pageType       PageType     @default(LANDING)
+  status         PageStatus   @default(DRAFT)
+
+  title          String
+  metaTitle      String
+  metaDescription String      @db.Text
+  canonicalUrl   String?
+  ogTitle        String?
+  ogDescription  String?      @db.Text
+  ogImageKey     String?
+  noindex        Boolean      @default(false)
+  jsonLd         Json? // schema.org
+
+  primaryKeyword String?
+  h1             String?
+  readingTimeMin Int?
+
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  blocks   ContentBlock[]
+  versions PageVersion[]
+  keywords PageKeyword[]
+
+  @@unique([organizationId, slug, locale])
+  @@index([organizationId, status])
+  @@index([slug])
+}
+
+enum PageType {
+  HOME
+  SERVICE
+  LANDING
+  BLOG_POST
+  PORTFOLIO
+  LEGAL
+  ABOUT
+  CONTACT
+  PRICING
+}
+
+enum PageStatus {
+  DRAFT
+  IN_REVIEW
+  PUBLISHED
+  ARCHIVED
+}
+
+model ContentBlock {
+  id        String    @id @default(cuid())
+  pageId    String
+  page      SEOPage   @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  type      BlockType
+  sortOrder Int       @default(0)
+  content   Json
+  isVisible Boolean   @default(true)
+
+  @@index([pageId, sortOrder])
+}
+
+enum BlockType {
+  HERO
+  RICH_TEXT
+  SERVICE_GRID
+  PRICING_TABLE
+  GALLERY
+  VIDEO
+  TESTIMONIALS
+  FAQ
+  CTA
+  STATS
+  PROCESS_STEPS
+  CONTACT_FORM
+  LOGO_CLOUD
+}
+
+model PageVersion {
+  id          String   @id @default(cuid())
+  pageId      String
+  page        SEOPage  @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  version     Int
+  snapshot    Json // página + blocos completos
+  changeNote  String?
+  publishedBy String?
+  createdAt   DateTime @default(now())
+
+  @@unique([pageId, version])
+  @@index([pageId, createdAt])
+}
+
+model Keyword {
+  id            String  @id @default(cuid())
+  term          String  @unique
+  locale        String  @default("pt-AO")
+  searchVolume  Int?
+  difficulty    Int?
+  intent        SearchIntent @default(INFORMATIONAL)
+  currentRank   Int?
+  targetRank    Int?
+  lastCheckedAt DateTime?
+
+  pages PageKeyword[]
+}
+
+enum SearchIntent {
+  INFORMATIONAL
+  NAVIGATIONAL
+  COMMERCIAL
+  TRANSACTIONAL
+  LOCAL
+}
+
+model PageKeyword {
+  pageId    String
+  page      SEOPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  keywordId String
+  keyword   Keyword @relation(fields: [keywordId], references: [id], onDelete: Cascade)
+  isPrimary Boolean @default(false)
+
+  @@id([pageId, keywordId])
+}
+
+model Redirect {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  fromPath       String
+  toPath         String
+  statusCode     Int          @default(301)
+  isActive       Boolean      @default(true)
+  hitCount       Int          @default(0)
+  lastHitAt      DateTime?
+  reason         String?
+  createdAt      DateTime     @default(now())
+
+  @@unique([organizationId, fromPath])
+  @@index([fromPath, isActive])
+}
+
+// =============================================================================
+// 10. NOTIFICATIONS
+// =============================================================================
+
+model NotificationTemplate {
+  id        String              @id @default(cuid())
+  key       String              @unique // booking.confirmed
+  channel   NotificationChannel
+  locale    String              @default("pt-AO")
+  subject   String?
+  body      String              @db.Text
+  variables String[]            @default([])
+  isActive  Boolean             @default(true)
+  updatedAt DateTime            @updatedAt
+
+  events NotificationEvent[]
+}
+
+enum NotificationChannel {
+  EMAIL
+  WHATSAPP
+  SMS
+  IN_APP
+  PUSH
+}
+
+model NotificationEvent {
+  id         String              @id @default(cuid())
+  templateId String?
+  template   NotificationTemplate? @relation(fields: [templateId], references: [id])
+  channel    NotificationChannel
+  eventType  String
+  entityType String?
+  entityId   String?
+  recipient  String // e-mail ou telefone
+  userId     String?
+  payload    Json                @default("{}")
+  status     NotificationStatus  @default(QUEUED)
+  attempts   Int                 @default(0)
+  providerId String?
+  error      String?
+  scheduledFor DateTime?
+  sentAt     DateTime?
+  deliveredAt DateTime?
+  openedAt   DateTime?
+  createdAt  DateTime            @default(now())
+
+  @@unique([eventType, entityId, channel]) // idempotência de envio
+  @@index([status, scheduledFor])
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  OPENED
+  FAILED
+  BOUNCED
+  SUPPRESSED
+}
+
+// =============================================================================
+// 11. AUDIT, EVENTOS E COMPLIANCE
+// =============================================================================
+
+// APPEND-ONLY. Sem UPDATE. Sem DELETE.
+model AuditLog {
+  id             String       @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  actorId        String?
+  actor          User?        @relation(fields: [actorId], references: [id])
+  actorType      ActorType    @default(USER)
+  action         String // booking.confirm, payment.override, file.download
+  entityType     String
+  entityId       String
+  before         Json?
+  after          Json?
+  reason         String? // obrigatório em overrides financeiros
+  ip             String?
+  userAgent      String?
+  requestId      String?
+  severity       AuditSeverity @default(INFO)
+  at             DateTime     @default(now())
+
+  @@index([organizationId, at])
+  @@index([entityType, entityId])
+  @@index([actorId, at])
+  @@index([action, at])
+}
+
+enum ActorType {
+  USER
+  SYSTEM
+  CRON
+  WEBHOOK
+  API_KEY
+}
+
+enum AuditSeverity {
+  INFO
+  NOTICE
+  WARNING
+  CRITICAL
+}
+
+// Outbox transacional
+model DomainEvent {
+  id             String       @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  eventType      String // BookingConfirmed, PaymentCaptured
+  aggregateType  String
+  aggregateId    String
+  payload        Json
+  version        Int          @default(1)
+  occurredAt     DateTime     @default(now())
+  processedAt    DateTime?
+  attempts       Int          @default(0)
+  lastError      String?
+  deadLetteredAt DateTime?
+
+  @@index([processedAt, occurredAt])
+  @@index([aggregateType, aggregateId])
+}
+
+model DataRequest {
+  id          String            @id @default(cuid())
+  type        DataRequestType
+  subjectEmail String
+  clientId    String?
+  status      DataRequestStatus @default(RECEIVED)
+  receivedAt  DateTime          @default(now())
+  dueAt       DateTime
+  completedAt DateTime?
+  handledById String?
+  notes       String?           @db.Text
+  exportKey   String?
+
+  @@index([status, dueAt])
+}
+
+enum DataRequestType {
+  ACCESS
+  RECTIFICATION
+  ERASURE
+  PORTABILITY
+  OBJECTION
+}
+
+enum DataRequestStatus {
+  RECEIVED
+  IN_PROGRESS
+  COMPLETED
+  REJECTED
+}
+
+model ApiKey {
+  id             String    @id @default(cuid())
+  organizationId String
+  name           String
+  keyHash        String    @unique
+  prefix         String
+  scopes         String[]  @default([])
+  lastUsedAt     DateTime?
+  expiresAt      DateTime?
+  revokedAt      DateTime?
+  createdById    String
+  createdAt      DateTime  @default(now())
+
+  @@index([organizationId, revokedAt])
+}

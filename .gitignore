@@ -1,0 +1,79 @@
+# ── Dependências ─────────────────────────────────────────────────────────────
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+
+# ── Build ────────────────────────────────────────────────────────────────────
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# ── Testes ───────────────────────────────────────────────────────────────────
+coverage/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# ── SEGREDOS — nunca commitar ────────────────────────────────────────────────
+# Uma chave commitada continua no histórico mesmo depois de apagada.
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env*.local
+*.pem
+*.key
+*.p12
+# .env.example É commitado de propósito: documenta as variáveis SEM valores.
+!.env.example
+
+# ── Prisma ───────────────────────────────────────────────────────────────────
+# O cliente gerado é reconstruído em cada build.
+prisma/generated/
+prisma/*.db
+prisma/*.db-journal
+
+# ── Plataformas ──────────────────────────────────────────────────────────────
+.vercel/
+.wrangler/
+.cloudflare/
+
+# ── Sistema operativo e editores ─────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ── Ficheiros de clientes — nunca no repositório ─────────────────────────────
+# Fotografias, vídeos e entregas vivem no Cloudflare R2 (ADR-005), não em Git.
+uploads/
+entregas/
+*.mp4
+*.mov
+*.raw
+*.cr3
+*.arw
+*.psd
